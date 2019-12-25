@@ -100,17 +100,68 @@ class NamedStruct:
         return dict(zip(self._fields, vals)), offset
 
 
-def unpack_string(buffer, offset):
+class ROOTObject:
+    def __init__(self):
+        self._fields = {}
+
+    def __repr__(self):
+        return "<%s instance at 0x%x with fields: %r>" % (type(self).__name__, id(self), self._fields)
+
+    @property
+    def fields(self):
+        return self._fields
+
+    def __getitem__(self, key):
+        return self._fields[key]
+
+
+class TStreamed(ROOTObject):
+    header1 = NamedStruct(">IH", ['fSize', 'fVersion'])
+
+    def read(self, buffer, offset=0):
+        fields, offset = TStreamed.header1.unpack_from(buffer, offset)
+        if not (fields['fSize'] & 0x40000000):
+            raise RuntimeError("Unsupported streamer version")
+        fields['fSize'] -= 0x40000000
+        self._end = offset + fields['fSize'] - 2  # fVersion
+        self._fields.update(fields)
+        if type(self) is TStreamed:
+            offset = self._end
+        return offset
+
+    def check(self, offset):
+        if offset < self._end:
+            raise RuntimeError("Did not read enough from a streamer")
+        if offset > self._end:
+            raise RuntimeError("Read too much from a streamer")
+
+
+class TString(ROOTObject):
     nBytes = NamedStruct(">B", 'nBytes')
     nBytesLong = NamedStruct(">i", 'nBytes')
-    length, offset = nBytes.unpack_from(buffer, offset)
-    if length == 255:
-        length, offset = nBytesLong.unpack_from(buffer, offset)
-    string, offset = bytes(buffer[offset:offset + length]), offset + length
-    return string, offset
+
+    @classmethod
+    def readstring(cls, buffer, offset):
+        length, offset = cls.nBytes.unpack_from(buffer, offset)
+        if length == 255:
+            length, offset = cls.nBytesLong.unpack_from(buffer, offset)
+        string, offset = bytes(buffer[offset:offset + length]), offset + length
+        return string, offset
+
+    def read(self, buffer, offset):
+        # TODO probably need to read streamer
+        self._fields['string'], offset = self.readstring(buffer, offset)
+        return offset
 
 
-class TFile:
+class NameTitle(ROOTObject):
+    def read(self, buffer, offset=0):
+        self._fields['fName'], offset = TString.readstring(buffer, offset)
+        self._fields['fTitle'], offset = TString.readstring(buffer, offset)
+        return offset
+
+
+class TFile(ROOTObject):
     header1 = NamedStruct(">4sii", ['magic', 'fVersion', 'fBEGIN'])
     header2_small = NamedStruct(">iiiiiBiii18s", ['fEND', 'fSeekFree', 'fNbytesFree', 'nfree', 'fNbytesName', 'fUnits', 'fCompress', 'fSeekInfo', 'fNbytesInfo', 'fUUID'])
     header2_big = NamedStruct(">qqiiiBiqi18s", ['fEND', 'fSeekFree', 'fNbytesFree', 'nfree', 'fNbytesName', 'fUnits', 'fCompress', 'fSeekInfo', 'fNbytesInfo', 'fUUID'])
@@ -120,43 +171,30 @@ class TFile:
         '''If this much can be read, we know how much the whole thing needs'''
         return cls.header1.size
 
-    def __init__(self):
-        self._fields = {}
-
     def read(self, buffer, offset=0):
-        fields, offset = self.header1.unpack_from(buffer, offset)
+        fields, offset = TFile.header1.unpack_from(buffer, offset)
         self._fields.update(fields)
         if self._fields['magic'] != b'root':
             raise RuntimeError("Wrong magic")
         if self._fields['fVersion'] < 1000000:
-            fields, offset = self.header2_small.unpack_from(buffer, offset)
+            fields, offset = TFile.header2_small.unpack_from(buffer, offset)
             self._fields.update(fields)
         else:
-            fields, offset = self.header2_big.unpack_from(buffer, offset)
+            fields, offset = TFile.header2_big.unpack_from(buffer, offset)
             self._fields.update(fields)
         # all zeros unti fBEGIN in theory
         offset = self._fields['fBEGIN']
         return offset
 
     @property
-    def fields(self):
-        return self._fields
-
-    @property
     def size(self):
         return self._fields['fBEGIN']
-
-    def __getitem__(self, key):
-        return self._fields[key]
-
-    def __repr__(self):
-        return "<TFile instance at 0x%x with fields: %r>" % (id(self), self._fields)
 
     def decompressor(self):
         return Compression.decompressor(self._fields['fCompress'])
 
 
-class TKey:
+class TKey(ROOTObject):
     header1 = NamedStruct(">ihiIhh", ['fNbytes', 'fVersion', 'fObjlen', 'fDatime', 'fKeylen', 'fCycle'])
     header2_small = NamedStruct(">ii", ['fSeekKey', 'fSeekPdir'])
     header2_big = NamedStruct(">qq", ['fSeekKey', 'fSeekPdir'])
@@ -165,53 +203,41 @@ class TKey:
     def minsize(cls):
         return cls.header1.size
 
-    def __init__(self):
-        self._fields = {}
-
     def read(self, buffer, offset=0):
-        fields, offset = self.header1.unpack_from(buffer, offset)
+        fields, offset = TKey.header1.unpack_from(buffer, offset)
         self._fields.update(fields)
         if self._fields['fVersion'] < 1000:
-            fields, offset = self.header2_small.unpack_from(buffer, offset)
+            fields, offset = TKey.header2_small.unpack_from(buffer, offset)
             self._fields.update(fields)
         else:
-            fields, offset = self.header2_big.unpack_from(buffer, offset)
+            fields, offset = TKey.header2_big.unpack_from(buffer, offset)
             self._fields.update(fields)
-        self._fields['fClassName'], offset = unpack_string(buffer, offset)
-        self._fields['fName'], offset = unpack_string(buffer, offset)
-        self._fields['fTitle'], offset = unpack_string(buffer, offset)
+        self._fields['fClassName'], offset = TString.readstring(buffer, offset)
+        self._fields['fName'], offset = TString.readstring(buffer, offset)
+        self._fields['fTitle'], offset = TString.readstring(buffer, offset)
         return offset
-
-    @property
-    def fields(self):
-        return self._fields
 
     @property
     def size(self):
         return self._fields['fKeylen']
-
-    def __getitem__(self, key):
-        return self._fields[key]
-
-    def __repr__(self):
-        return "<TKey instance at 0x%x with fields: %r>" % (id(self), self._fields)
 
     @property
     def compressed(self):
         return self._fields['fNbytes'] < (self._fields['fKeylen'] + self._fields['fObjlen'])
 
 
-class TKeyList(Mapping):
+class TKeyList(ROOTObject, Mapping):
     nKeys = NamedStruct(">i", 'nKeys')
 
     def __init__(self):
+        super().__init__()
         self.headkey = TKey()
         self._keys = {}
 
     def read(self, buffer, offset=0):
         offset = self.headkey.read(buffer, offset)
         end = offset + self.headkey['fObjlen']
-        nkeys, offset = self.nKeys.unpack_from(buffer, offset)
+        nkeys, offset = TKeyList.nKeys.unpack_from(buffer, offset)
         while offset < end:
             key = TKey()
             offset = key.read(buffer, offset)
@@ -233,39 +259,22 @@ class TKeyList(Mapping):
         return "<TKeyList instance at 0x%x with keys: [\n    %s\n]>" % (id(self), "\n    ".join(repr(k) for k in self._keys.values()))
 
 
-class TNamed:
-    def __init__(self):
-        self._fields = {}
-
-    def read(self, buffer, offset=0):
-        self._fields['fName'], offset = unpack_string(buffer, offset)
-        self._fields['fTitle'], offset = unpack_string(buffer, offset)
-        return offset
-
-    def __repr__(self):
-        return "<%s instance at 0x%x with fields: %r>" % (type(self).__name__, id(self), self._fields)
-
-
-class TDirectory(TNamed):
+class TDirectory(ROOTObject):
     header1 = NamedStruct(">hIIii", ['fVersion', 'fDatimeC', 'fDatimeM', 'fNbytesKeys', 'fNbytesName'])
     header2_small = NamedStruct(">iii", ['fSeekDir', 'fSeekParent', 'fSeekKeys'])
     header2_big = NamedStruct(">qqq", ['fSeekDir', 'fSeekParent', 'fSeekKeys'])
 
     def read(self, buffer, offset=0):
-        offset = super().read(buffer, offset)
-        fields, offset = self.header1.unpack_from(buffer, offset)
+        offset = NameTitle.read(self, buffer, offset)
+        fields, offset = TDirectory.header1.unpack_from(buffer, offset)
         self._fields.update(fields)
         if self._fields['fVersion'] < 1000000:
-            fields, offset = self.header2_small.unpack_from(buffer, offset)
+            fields, offset = TDirectory.header2_small.unpack_from(buffer, offset)
             self._fields.update(fields)
         else:
-            fields, offset = self.header2_big.unpack_from(buffer, offset)
+            fields, offset = TDirectory.header2_big.unpack_from(buffer, offset)
             self._fields.update(fields)
         return offset
-
-    @property
-    def fields(self):
-        return self._fields
 
     def __getitem__(self, key):
         return self._fields[key]
@@ -280,25 +289,22 @@ class Compression:
         if isinstance(fCompress, bytes):
             fCompress = cls.magicmap[fCompress]
         if fCompress == cls.kZLIB:
-            from zlib import decompress as zlib_decompress
-
             def decompress(bytes, uncompressed_size):
+                from zlib import decompress as zlib_decompress
                 return zlib_decompress(bytes)
 
             return decompress
         elif fCompress == cls.kLZMA:
-            from lzma import decompress as lzma_decompress
-
             def decompress(bytes, uncompressed_size):
+                from lzma import decompress as lzma_decompress
                 return lzma_decompress(bytes)
 
             return decompress
         elif fCompress == cls.kOldCompressionAlgo:
             raise NotImplementedError("kOldCompressionAlgo")
         elif fCompress == cls.kLZ4:
-            from lz4.block import decompress as lz4_decompress
-
             def decompress(bytes, uncompressed_size):
+                from lz4.block import decompress as lz4_decompress
                 return lz4_decompress(bytes, uncompressed_size=uncompressed_size)
 
             return decompress
@@ -307,30 +313,24 @@ class Compression:
         raise RuntimeError("Compression not supported")
 
 
-class CompressionHeader:
+class CompressionHeader(ROOTObject):
     header = NamedStruct(">2sB3s3s", ['magic', 'version', 'compressed_size', 'uncompressed_size'])
     l4header = NamedStruct(">Q", 'checksum')
     l4dochecksum = True
-
-    def __init__(self):
-        self._fields = {}
 
     def decode_size(self, field):
         decoder = struct.Struct("<I")  # big-endian everywhere else but here
         return decoder.unpack(field + b'\x00')[0]
 
     def read(self, buffer, offset=0):
-        fields, offset = self.header.unpack_from(buffer, offset)
+        fields, offset = CompressionHeader.header.unpack_from(buffer, offset)
         # 3 byte fields is absolutely positively disgusting and you should feel bad
         fields['compressed_size'] = self.decode_size(fields['compressed_size'])
         fields['uncompressed_size'] = self.decode_size(fields['uncompressed_size'])
         self._fields.update(fields)
         if self._fields['magic'] == 'L4':
-            self._fields['checksum'], offset = self.l4header.unpack_from(buffer, offset)
+            self._fields['checksum'], offset = CompressionHeader.l4header.unpack_from(buffer, offset)
         return offset
-
-    def __repr__(self):
-        return "<%s instance at 0x%x with fields: %r>" % (type(self).__name__, id(self), self._fields)
 
     def decompressor(self):
         decompressor = Compression.decompressor(self._fields['magic'])
@@ -345,7 +345,94 @@ class CompressionHeader:
         return partial(decompressor, uncompressed_size=self._fields['uncompressed_size'])
 
 
+class TObject(TStreamed):
+    header1 = NamedStruct(">HII", ['whatsthis', 'fBits', 'fUniqueID'])
+
+    def read(self, buffer, offset=0):
+        offset = super().read(buffer, offset)
+        fields, offset = TObject.header1.unpack_from(buffer, offset)
+        self._fields.update(fields)
+        if type(self) is TObject:
+            self.check(offset)
+        return offset
+
+
+class TNamed(TObject):
+    def read(self, buffer, offset=0):
+        offset = super().read(buffer, offset)
+        offset = NameTitle.read(self, buffer, offset)
+        if type(self) is TNamed:
+            self.check(offset)
+        return offset
+
+
+class TAttLine(TStreamed):
+    header1 = NamedStruct(">hhh", ['fLineColor', 'fLineStyle', 'fLineWidth'])
+
+    def read(self, buffer, offset=0):
+        offset = super().read(buffer, offset)
+        if self._fields['fVersion'] != 2:
+            raise RuntimeError("Unrecognized TAttLine version")
+        fields, offset = TAttLine.header1.unpack_from(buffer, offset)
+        self._fields.update(fields)
+        if type(self) is TAttLine:
+            self.check(offset)
+        return offset
+
+
+class TTree(TStreamed):
+    supers = [TNamed, TAttLine, TStreamed, TStreamed]  # TAttFill, TAttMarker
+    header_v20 = NamedStruct(
+        ">qqqqqdiiiiIqqqqqq",
+        [
+            'fEntries', 'fTotBytes', 'fZipBytes', 'fSavedBytes', 'fFlushedBytes', 'fWeight',
+            'fTimerInterval', 'fScanField', 'fUpdate', 'fDefaultEntryOffsetLen', 'fNClusterRange',
+            'fMaxEntries', 'fMaxEntryLoop', 'fMaxVirtualSize', 'fAutoSave', 'fAutoFlush', 'fEstimate',
+            'fClusterRangeEnd', 'fClusterSize', 'fIOFeatures', 'fBranches', 'fLeaves', 'fAliases',
+            'fIndexValues', 'fIndex', 'fTreeIndex', 'fFriends'
+        ]
+    )
+
+    def read(self, buffer, offset=0):
+        offset = super().read(buffer, offset)
+        for cls in TTree.supers:
+            superinfo = cls()
+            offset = superinfo.read(buffer, offset)
+            self._fields[cls.__name__] = superinfo
+
+        if self._fields['fVersion'] == 20:
+            fields, offset = TTree.header_v20.unpack_from(buffer, offset)
+            self._fields.update(fields)
+        else:
+            raise RuntimeError("Unknown TTree class version")
+        print(buffer[offset:offset + 60])
+        # from uproot:
+        # fBasketSeek_dtype = cls._dtype1
+        # if getattr(context, "speedbump", True):
+        #     cursor.skip(1)
+        # self._fClusterRangeEnd = cursor.array(source, self._fNClusterRange, fBasketSeek_dtype)
+        # fBasketSeek_dtype = cls._dtype2
+        # if getattr(context, "speedbump", True):
+        #     cursor.skip(1)
+        # self._fClusterSize = cursor.array(source, self._fNClusterRange, fBasketSeek_dtype)
+        # self._fIOFeatures = ROOT_3a3a_TIOFeatures.read(source, cursor, context, self)
+        # self._fBranches = TObjArray.read(source, cursor, context, self)
+        # self._fLeaves = TObjArray.read(source, cursor, context, self)
+        # self._fAliases = _readobjany(source, cursor, context, parent)
+        # self._fIndexValues = TArrayD.read(source, cursor, context, self)
+        # self._fIndex = TArrayI.read(source, cursor, context, self)
+        # self._fTreeIndex = _readobjany(source, cursor, context, parent)
+        # self._fFriends = _readobjany(source, cursor, context, parent)
+        # _readobjany(source, cursor, context, parent, asclass=Undefined)
+        # _readobjany(source, cursor, context, parent, asclass=Undefined)
+        return offset
+
+
 class ROOTFile:
+    classmap = {
+        b'TTree': TTree,
+    }
+
     def __init__(self, url):
         self._file = XRootDFile(url)
         self._open_readstep = 300
@@ -391,9 +478,10 @@ class ROOTFile:
 
     async def __getitem__(self, key):
         key = self.keyslist[key]
-        # Worth reading key at object?
-        objbytes = await self._file.read(key['fSeekKey'] + key['fKeylen'], key['fNbytes'] - key['fKeylen'])
         print(key)
+        obj = ROOTFile.classmap[key['fClassName']]()
+        # worth reading key at object? not doing now
+        objbytes = await self._file.read(key['fSeekKey'] + key['fKeylen'], key['fNbytes'] - key['fKeylen'])
 
         if key.compressed:
             cheader = CompressionHeader()
@@ -402,8 +490,8 @@ class ROOTFile:
             # TODO run in thread pool
             objbytes = cheader.decompressor()(memoryview(objbytes)[offset:])
 
-        print(len(objbytes), objbytes[:30].hex())
-        return objbytes
+        obj.read(objbytes)
+        return obj
 
 
 async def main():
@@ -435,7 +523,7 @@ async def main():
     async with ROOTFile(url) as file:
         print(file.keyslist.headkey)
         print(list(file.keys()))
-        await file[b'Events']
+        print(await file[b'Events'])
     toc = time.time()
     print("Elapsed:", toc - tic)
 
