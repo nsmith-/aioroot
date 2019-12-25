@@ -2,11 +2,12 @@ import time
 import asyncio
 import struct
 import warnings
+from collections.abc import Mapping
 from functools import partial
 from pyxrootd.client import File
 
 
-class AsyncFile:
+class XRootDFile:
     def __init__(self, url):
         self._url = url
         self._file = File()
@@ -151,6 +152,9 @@ class TFile:
     def __repr__(self):
         return "<TFile instance at 0x%x with fields: %r>" % (id(self), self._fields)
 
+    def decompressor(self):
+        return Compression.decompressor(self._fields['fCompress'])
+
 
 class TKey:
     header1 = NamedStruct(">ihiIhh", ['fNbytes', 'fVersion', 'fObjlen', 'fDatime', 'fKeylen', 'fCycle'])
@@ -192,32 +196,41 @@ class TKey:
     def __repr__(self):
         return "<TKey instance at 0x%x with fields: %r>" % (id(self), self._fields)
 
+    @property
+    def compressed(self):
+        return self._fields['fNbytes'] < (self._fields['fKeylen'] + self._fields['fObjlen'])
 
-class KeysList:
+
+class TKeyList(Mapping):
     nKeys = NamedStruct(">i", 'nKeys')
 
     def __init__(self):
         self.headkey = TKey()
-        self.keys = []
+        self._keys = {}
 
     def read(self, buffer, offset=0):
         offset = self.headkey.read(buffer, offset)
         end = offset + self.headkey['fObjlen']
-        print(self.headkey, end)
         nkeys, offset = self.nKeys.unpack_from(buffer, offset)
         while offset < end:
             key = TKey()
             offset = key.read(buffer, offset)
-            self.keys.append(key)
-        if len(self.keys) != nkeys:
-            raise RuntimeError("Expected to read %d keys but got %d in %r" % (nkeys, len(self.keys), self))
+            self._keys[key['fName']] = key
+        if len(self._keys) != nkeys:
+            raise RuntimeError("Expected to read %d keys but got %d in %r" % (nkeys, len(self._keys), self))
         return offset
 
     def __iter__(self):
-        return iter(self.keys)
+        return iter(self._keys)
+
+    def __len__(self):
+        return len(self._keys)
+
+    def __getitem__(self, key):
+        return self._keys.__getitem__(key)
 
     def __repr__(self):
-        return "<KeysList instance at 0x%x with keys: [\n    %s\n]>" % (id(self), "\n    ".join(repr(k) for k in self.keys))
+        return "<TKeyList instance at 0x%x with keys: [\n    %s\n]>" % (id(self), "\n    ".join(repr(k) for k in self._keys.values()))
 
 
 class TNamed:
@@ -258,38 +271,139 @@ class TDirectory(TNamed):
         return self._fields[key]
 
 
-async def getsize(url):
-    async with AsyncFile(url) as f:
-        size = (await f.stat())['size']
+class Compression:
+    _, kZLIB, kLZMA, kOldCompressionAlgo, kLZ4, kZSTD = range(6)
+    magicmap = {b'ZL': kZLIB, b'XZ': kLZMA, b'L4': kLZ4, b'ZS': kZSTD}
 
-        readhint = 300
-        headbytes = await f.read(0, readhint)
-        fileheader = TFile()
-        offset = fileheader.read(headbytes)
-        print("TFile:", fileheader)
+    @classmethod
+    def decompressor(cls, fCompress):
+        if isinstance(fCompress, bytes):
+            fCompress = cls.magicmap[fCompress]
+        if fCompress == cls.kZLIB:
+            from zlib import decompress as zlib_decompress
 
-        rootkey = TKey()
-        if offset + rootkey.minsize() > len(headbytes):
+            def decompress(bytes, uncompressed_size):
+                return zlib_decompress(bytes)
+
+            return decompress
+        elif fCompress == cls.kLZMA:
+            from lzma import decompress as lzma_decompress
+
+            def decompress(bytes, uncompressed_size):
+                return lzma_decompress(bytes)
+
+            return decompress
+        elif fCompress == cls.kOldCompressionAlgo:
+            raise NotImplementedError("kOldCompressionAlgo")
+        elif fCompress == cls.kLZ4:
+            from lz4.block import decompress as lz4_decompress
+
+            def decompress(bytes, uncompressed_size):
+                return lz4_decompress(bytes, uncompressed_size=uncompressed_size)
+
+            return decompress
+        elif fCompress == cls.kZSTD:
+            raise NotImplementedError("kZSTD")
+        raise RuntimeError("Compression not supported")
+
+
+class CompressionHeader:
+    header = NamedStruct(">2sB3s3s", ['magic', 'version', 'compressed_size', 'uncompressed_size'])
+    l4header = NamedStruct(">Q", 'checksum')
+    l4dochecksum = True
+
+    def __init__(self):
+        self._fields = {}
+
+    def decode_size(self, field):
+        decoder = struct.Struct("<I")  # big-endian everywhere else but here
+        return decoder.unpack(field + b'\x00')[0]
+
+    def read(self, buffer, offset=0):
+        fields, offset = self.header.unpack_from(buffer, offset)
+        # 3 byte fields is absolutely positively disgusting and you should feel bad
+        fields['compressed_size'] = self.decode_size(fields['compressed_size'])
+        fields['uncompressed_size'] = self.decode_size(fields['uncompressed_size'])
+        self._fields.update(fields)
+        if self._fields['magic'] == 'L4':
+            self._fields['checksum'], offset = self.l4header.unpack_from(buffer, offset)
+        return offset
+
+    def __repr__(self):
+        return "<%s instance at 0x%x with fields: %r>" % (type(self).__name__, id(self), self._fields)
+
+    def decompressor(self):
+        decompressor = Compression.decompressor(self._fields['magic'])
+        if self.l4dochecksum and self._fields['magic'] == 'L4':
+            def decompress(bytes, uncompressed_size):
+                import xxhash
+                out = decompressor(bytes, uncompressed_size=self._fields['uncompressed_size'])
+                if xxhash.xxh64(out).intdigest() != self._fields['checksum']:
+                    raise RuntimeError("Checksum mismatch while decompressing")
+                return out
+            return decompress
+        return partial(decompressor, uncompressed_size=self._fields['uncompressed_size'])
+
+
+class ROOTFile:
+    def __init__(self, url):
+        self._file = XRootDFile(url)
+        self._open_readstep = 300
+        self.fileheader = TFile()
+        self.rootkey = TKey()
+        self.rootdir = TDirectory()
+        self.keyslist = TKeyList()
+
+    async def open(self):
+        await self._file.open()
+
+        headbytes = await self._file.read(0, self._open_readstep)
+
+        offset = self.fileheader.read(headbytes)
+        if offset + self.rootkey.minsize() > len(headbytes):
             warnings.warn("Readahead too small in file open", RuntimeWarning)
-            headbytes = headbytes + (await f.read(len(headbytes), readhint))
-        offset = rootkey.read(headbytes, offset)
-        print("Root TKey:", rootkey)
+            headbytes = headbytes + (await self._file.read(len(headbytes), self._open_readstep))
 
-        if rootkey['fSeekKey'] != fileheader['fBEGIN']:
+        offset = self.rootkey.read(headbytes, offset)
+        if self.rootkey['fSeekKey'] != self.fileheader['fBEGIN']:
             raise RuntimeError("Root directory object not immediately after key")
-        if offset + rootkey['fObjlen'] > len(headbytes):
+        if offset + self.rootkey['fObjlen'] > len(headbytes):
             warnings.warn("Readahead too small in file open", RuntimeWarning)
-            headbytes = headbytes + (await f.read(len(headbytes), readhint))
-        rootdir = TDirectory()
-        offset = rootdir.read(headbytes, offset)
-        print("Root directory:", rootdir)
+            headbytes = headbytes + (await self._file.read(len(headbytes), self._open_readstep))
 
-        keysbytes = await f.read(rootdir['fSeekKeys'], rootdir['fNbytesKeys'])
-        keyslist = KeysList()
-        offset = keyslist.read(keysbytes)
-        print("Directory Keylist:", keyslist)
+        offset = self.rootdir.read(headbytes, offset)
+        keysbytes = await self._file.read(self.rootdir['fSeekKeys'], self.rootdir['fNbytesKeys'])
 
-    return url, size
+        offset = self.keyslist.read(keysbytes)
+        return self
+
+    async def close(self):
+        return await self._file.close()
+
+    async def __aenter__(self):
+        return await self.open()
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return await self.close()
+
+    def keys(self):
+        return self.keyslist.keys()
+
+    async def __getitem__(self, key):
+        key = self.keyslist[key]
+        # Worth reading key at object?
+        objbytes = await self._file.read(key['fSeekKey'] + key['fKeylen'], key['fNbytes'] - key['fKeylen'])
+        print(key)
+
+        if key.compressed:
+            cheader = CompressionHeader()
+            offset = cheader.read(objbytes)
+            print(cheader)
+            # TODO run in thread pool
+            objbytes = cheader.decompressor()(memoryview(objbytes)[offset:])
+
+        print(len(objbytes), objbytes[:30].hex())
+        return objbytes
 
 
 async def main():
@@ -316,11 +430,12 @@ async def main():
         "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job28_job28_file1680to1739.root",
     ]
 
-    urls = urls[:1]
+    url = urls[0]
     tic = time.time()
-    for future in asyncio.as_completed(map(getsize, urls)):
-        size = await future
-        print(size)
+    async with ROOTFile(url) as file:
+        print(file.keyslist.headkey)
+        print(list(file.keys()))
+        await file[b'Events']
     toc = time.time()
     print("Elapsed:", toc - tic)
 
