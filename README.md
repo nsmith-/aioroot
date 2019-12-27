@@ -15,12 +15,16 @@ the structures.  The net effect is an on average 5x speedup for a list of 10 fil
 Running this demo at home (in the US):
 ```
 $ ./demo.py
-Elapsed (async): 3.28
-Elapsed (uproot): 24.47
+Elapsed (async): 3.28 s
+Elapsed (uproot): 24.47 s
 All entries agree? True
 ```
 and running it on a CERN lxplus machine (very close to the file servers):
 ```
+$ ./demo.py
+Elapsed (async): 0.05 s
+Elapsed (uproot): 0.24 s
+All entries agree? True
 ```
 
 In preparing this implementation, the structure unpacking functions had to be largely reworked

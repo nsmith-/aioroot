@@ -39,7 +39,7 @@ async def main():
             url, entries = await result
             entries_async[url] = entries
         toc = time.time()
-        print("Elapsed (async): %.2f" % (toc - tic))
+        print("Elapsed (async): %.2f s" % (toc - tic))
 
         # prime the plumbing
         await asyncio.get_event_loop().run_in_executor(threadpool, uproot.numentries, urls[0], b'Events')
@@ -50,7 +50,7 @@ async def main():
             entries = await asyncio.get_event_loop().run_in_executor(threadpool, uproot.numentries, url, b'Events')
             entries_uproot[url] = entries
         toc = time.time()
-        print("Elapsed (uproot): %.2f" % (toc - tic))
+        print("Elapsed (uproot): %.2f s" % (toc - tic))
 
         print("All entries agree?", all(entries_async[url] == entries_uproot[url] for url in urls))
 
