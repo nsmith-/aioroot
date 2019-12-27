@@ -3,8 +3,11 @@ import asyncio
 import struct
 import warnings
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pyxrootd.client import File
+from pprint import pprint
+import uproot
 
 
 class XRootDFile:
@@ -15,6 +18,8 @@ class XRootDFile:
         self._servers = []
 
     def _handle(self, future, status, content, servers):
+        if future.cancelled():
+            return
         try:
             if not status['ok']:
                 raise IOError(status['message'].strip())
@@ -32,6 +37,9 @@ class XRootDFile:
         return self
 
     async def close(self):
+        if not self._file.is_open():
+            self._file = None
+            return
         future = asyncio.get_event_loop().create_future()
         res = self._file.close(timeout=self._timeout, callback=partial(self._handle, future))
         if not res['ok']:
@@ -102,17 +110,10 @@ class NamedStruct:
 
 class ROOTObject:
     def __init__(self):
-        self._fields = {}
+        self.data = {}
 
     def __repr__(self):
-        return "<%s instance at 0x%x with fields: %r>" % (type(self).__name__, id(self), self._fields)
-
-    @property
-    def fields(self):
-        return self._fields
-
-    def __getitem__(self, key):
-        return self._fields[key]
+        return "<%s instance at 0x%x with data: %r>" % (type(self).__name__, id(self), self.data)
 
 
 class TStreamed(ROOTObject):
@@ -124,7 +125,7 @@ class TStreamed(ROOTObject):
             raise RuntimeError("Unsupported streamer version")
         fields['fSize'] -= 0x40000000
         self._end = offset + fields['fSize'] - 2  # fVersion
-        self._fields.update(fields)
+        self.data.update(fields)
         if type(self) is TStreamed:
             offset = self._end
         return offset
@@ -150,14 +151,14 @@ class TString(ROOTObject):
 
     def read(self, buffer, offset):
         # TODO probably need to read streamer
-        self._fields['string'], offset = self.readstring(buffer, offset)
+        self.data['string'], offset = self.readstring(buffer, offset)
         return offset
 
 
 class NameTitle(ROOTObject):
     def read(self, buffer, offset=0):
-        self._fields['fName'], offset = TString.readstring(buffer, offset)
-        self._fields['fTitle'], offset = TString.readstring(buffer, offset)
+        self.data['fName'], offset = TString.readstring(buffer, offset)
+        self.data['fTitle'], offset = TString.readstring(buffer, offset)
         return offset
 
 
@@ -173,25 +174,25 @@ class TFile(ROOTObject):
 
     def read(self, buffer, offset=0):
         fields, offset = TFile.header1.unpack_from(buffer, offset)
-        self._fields.update(fields)
-        if self._fields['magic'] != b'root':
+        self.data.update(fields)
+        if self.data['magic'] != b'root':
             raise RuntimeError("Wrong magic")
-        if self._fields['fVersion'] < 1000000:
+        if self.data['fVersion'] < 1000000:
             fields, offset = TFile.header2_small.unpack_from(buffer, offset)
-            self._fields.update(fields)
+            self.data.update(fields)
         else:
             fields, offset = TFile.header2_big.unpack_from(buffer, offset)
-            self._fields.update(fields)
+            self.data.update(fields)
         # all zeros unti fBEGIN in theory
-        offset = self._fields['fBEGIN']
+        offset = self.data['fBEGIN']
         return offset
 
     @property
     def size(self):
-        return self._fields['fBEGIN']
+        return self.data['fBEGIN']
 
     def decompressor(self):
-        return Compression.decompressor(self._fields['fCompress'])
+        return Compression.decompressor(self.data['fCompress'])
 
 
 class TKey(ROOTObject):
@@ -204,26 +205,33 @@ class TKey(ROOTObject):
         return cls.header1.size
 
     def read(self, buffer, offset=0):
+        start = offset
         fields, offset = TKey.header1.unpack_from(buffer, offset)
-        self._fields.update(fields)
-        if self._fields['fVersion'] < 1000:
+        self.data.update(fields)
+        if self.data['fVersion'] < 1000:
             fields, offset = TKey.header2_small.unpack_from(buffer, offset)
-            self._fields.update(fields)
+            self.data.update(fields)
         else:
             fields, offset = TKey.header2_big.unpack_from(buffer, offset)
-            self._fields.update(fields)
-        self._fields['fClassName'], offset = TString.readstring(buffer, offset)
-        self._fields['fName'], offset = TString.readstring(buffer, offset)
-        self._fields['fTitle'], offset = TString.readstring(buffer, offset)
+            self.data.update(fields)
+        self.data['fClassName'], offset = TString.readstring(buffer, offset)
+        self.data['fName'], offset = TString.readstring(buffer, offset)
+        self.data['fTitle'], offset = TString.readstring(buffer, offset)
+        if start + self.data['fKeylen'] != offset:
+            raise RuntimeError("Read fewer bytes from TKey (%d) than expected (%d)" % (offset - start, self.data['fKeylen']))
         return offset
 
     @property
     def size(self):
-        return self._fields['fKeylen']
+        return self.data['fKeylen']
 
     @property
     def compressed(self):
-        return self._fields['fNbytes'] < (self._fields['fKeylen'] + self._fields['fObjlen'])
+        return self.data['fNbytes'] < (self.data['fKeylen'] + self.data['fObjlen'])
+
+    @property
+    def namecycle(self):
+        return b'%s;%d' % (self.data['fName'], self.data['fCycle'])
 
 
 class TKeyList(ROOTObject, Mapping):
@@ -232,18 +240,27 @@ class TKeyList(ROOTObject, Mapping):
     def __init__(self):
         super().__init__()
         self.headkey = TKey()
+        self.data['headkey'] = self.headkey
         self._keys = {}
+        self.data['keys'] = self._keys
+        self._lastcycle = {}
 
     def read(self, buffer, offset=0):
         offset = self.headkey.read(buffer, offset)
-        end = offset + self.headkey['fObjlen']
+        end = offset + self.headkey.data['fObjlen']
         nkeys, offset = TKeyList.nKeys.unpack_from(buffer, offset)
-        while offset < end:
+        self.data['nKeys'] = nkeys
+        while offset < end and len(self._keys) < nkeys:
             key = TKey()
             offset = key.read(buffer, offset)
-            self._keys[key['fName']] = key
+            self._keys[key.namecycle] = key
+            if self._lastcycle.get(key.data['fName'], -1) < key.data['fCycle']:
+                self._lastcycle[key.data['fName']] = key.data['fCycle']
         if len(self._keys) != nkeys:
             raise RuntimeError("Expected to read %d keys but got %d in %r" % (nkeys, len(self._keys), self))
+        if offset < end:
+            self.data['trailings'] = bytes(buffer[offset:end])
+            offset = end
         return offset
 
     def __iter__(self):
@@ -252,11 +269,10 @@ class TKeyList(ROOTObject, Mapping):
     def __len__(self):
         return len(self._keys)
 
-    def __getitem__(self, key):
-        return self._keys.__getitem__(key)
-
-    def __repr__(self):
-        return "<TKeyList instance at 0x%x with keys: [\n    %s\n]>" % (id(self), "\n    ".join(repr(k) for k in self._keys.values()))
+    def __getitem__(self, keyname):
+        if keyname not in self._keys:
+            keyname = b'%s;%d' % (keyname, self._lastcycle[keyname])
+        return self._keys.__getitem__(keyname)
 
 
 class TDirectory(ROOTObject):
@@ -267,17 +283,17 @@ class TDirectory(ROOTObject):
     def read(self, buffer, offset=0):
         offset = NameTitle.read(self, buffer, offset)
         fields, offset = TDirectory.header1.unpack_from(buffer, offset)
-        self._fields.update(fields)
-        if self._fields['fVersion'] < 1000000:
+        self.data.update(fields)
+        if self.data['fVersion'] < 1000:
             fields, offset = TDirectory.header2_small.unpack_from(buffer, offset)
-            self._fields.update(fields)
+            self.data.update(fields)
         else:
             fields, offset = TDirectory.header2_big.unpack_from(buffer, offset)
-            self._fields.update(fields)
+            self.data.update(fields)
         return offset
 
     def __getitem__(self, key):
-        return self._fields[key]
+        return self.data[key]
 
 
 class Compression:
@@ -327,22 +343,23 @@ class CompressionHeader(ROOTObject):
         # 3 byte fields is absolutely positively disgusting and you should feel bad
         fields['compressed_size'] = self.decode_size(fields['compressed_size'])
         fields['uncompressed_size'] = self.decode_size(fields['uncompressed_size'])
-        self._fields.update(fields)
-        if self._fields['magic'] == 'L4':
-            self._fields['checksum'], offset = CompressionHeader.l4header.unpack_from(buffer, offset)
+        self.data.update(fields)
+        if self.data['magic'] == 'L4':
+            self.data['checksum'], offset = CompressionHeader.l4header.unpack_from(buffer, offset)
         return offset
 
     def decompressor(self):
-        decompressor = Compression.decompressor(self._fields['magic'])
-        if self.l4dochecksum and self._fields['magic'] == 'L4':
-            def decompress(bytes, uncompressed_size):
+        decompressor = Compression.decompressor(self.data['magic'])
+        if self.l4dochecksum and self.data['magic'] == 'L4':
+            def decompress(bytes):
                 import xxhash
-                out = decompressor(bytes, uncompressed_size=self._fields['uncompressed_size'])
-                if xxhash.xxh64(out).intdigest() != self._fields['checksum']:
+                out = decompressor(bytes, uncompressed_size=self.data['uncompressed_size'])
+                if xxhash.xxh64(out).intdigest() != self.data['checksum']:
                     raise RuntimeError("Checksum mismatch while decompressing")
                 return out
+
             return decompress
-        return partial(decompressor, uncompressed_size=self._fields['uncompressed_size'])
+        return partial(decompressor, uncompressed_size=self.data['uncompressed_size'])
 
 
 class TObject(TStreamed):
@@ -351,7 +368,7 @@ class TObject(TStreamed):
     def read(self, buffer, offset=0):
         offset = super().read(buffer, offset)
         fields, offset = TObject.header1.unpack_from(buffer, offset)
-        self._fields.update(fields)
+        self.data.update(fields)
         if type(self) is TObject:
             self.check(offset)
         return offset
@@ -371,10 +388,10 @@ class TAttLine(TStreamed):
 
     def read(self, buffer, offset=0):
         offset = super().read(buffer, offset)
-        if self._fields['fVersion'] != 2:
+        if self.data['fVersion'] != 2:
             raise RuntimeError("Unrecognized TAttLine version")
         fields, offset = TAttLine.header1.unpack_from(buffer, offset)
-        self._fields.update(fields)
+        self.data.update(fields)
         if type(self) is TAttLine:
             self.check(offset)
         return offset
@@ -398,14 +415,14 @@ class TTree(TStreamed):
         for cls in TTree.supers:
             superinfo = cls()
             offset = superinfo.read(buffer, offset)
-            self._fields[cls.__name__] = superinfo
+            self.data[cls.__name__] = superinfo
 
-        if self._fields['fVersion'] == 20:
+        if self.data['fVersion'] == 20:
             fields, offset = TTree.header_v20.unpack_from(buffer, offset)
-            self._fields.update(fields)
+            self.data.update(fields)
         else:
             raise RuntimeError("Unknown TTree class version")
-        print(buffer[offset:offset + 60])
+        # print(buffer[offset:offset + 60])
         # from uproot:
         # fBasketSeek_dtype = cls._dtype1
         # if getattr(context, "speedbump", True):
@@ -433,38 +450,51 @@ class ROOTFile:
         b'TTree': TTree,
     }
 
-    def __init__(self, url):
+    def __init__(self, url, threadpool=None):
         self._file = XRootDFile(url)
-        self._open_readstep = 300
+        self._open_readstep = 512  # ROOT uses 300
+        self._ownpool = None
+        self._threadpool = threadpool
+        if threadpool is None:
+            self._ownpool = partial(ThreadPoolExecutor, max_workers=1)
         self.fileheader = TFile()
         self.rootkey = TKey()
         self.rootdir = TDirectory()
         self.keyslist = TKeyList()
 
+    async def _run_in_pool(self, fun, *args):
+        return await asyncio.get_event_loop().run_in_executor(self._threadpool, fun, *args)
+
     async def open(self):
+        if self._ownpool is not None:
+            self._threadpool = self._ownpool()
         await self._file.open()
 
         headbytes = await self._file.read(0, self._open_readstep)
 
         offset = self.fileheader.read(headbytes)
         if offset + self.rootkey.minsize() > len(headbytes):
-            warnings.warn("Readahead too small in file open", RuntimeWarning)
-            headbytes = headbytes + (await self._file.read(len(headbytes), self._open_readstep))
+            warnings.warn("Readahead too small in file open to reach root key", RuntimeWarning)
+            more = max(offset + self.rootkey.minsize() - len(headbytes), self._open_readstep)
+            headbytes = headbytes + (await self._file.read(len(headbytes), more))
 
         offset = self.rootkey.read(headbytes, offset)
-        if self.rootkey['fSeekKey'] != self.fileheader['fBEGIN']:
+        if self.rootkey.data['fSeekKey'] != self.fileheader.data['fBEGIN']:
             raise RuntimeError("Root directory object not immediately after key")
-        if offset + self.rootkey['fObjlen'] > len(headbytes):
-            warnings.warn("Readahead too small in file open", RuntimeWarning)
-            headbytes = headbytes + (await self._file.read(len(headbytes), self._open_readstep))
+        if offset + self.rootkey.data['fObjlen'] > len(headbytes):
+            warnings.warn("Readahead too small in file open to reach end of root directory header", RuntimeWarning)
+            more = offset + self.rootkey.data['fObjlen'] - len(headbytes)
+            headbytes = headbytes + (await self._file.read(len(headbytes), more))
 
         offset = self.rootdir.read(headbytes, offset)
-        keysbytes = await self._file.read(self.rootdir['fSeekKeys'], self.rootdir['fNbytesKeys'])
+        keysbytes = await self._file.read(self.rootdir.data['fSeekKeys'], self.rootdir.data['fNbytesKeys'])
 
         offset = self.keyslist.read(keysbytes)
         return self
 
     async def close(self):
+        if self._ownpool is not None:
+            self._threadpool = None
         return await self._file.close()
 
     async def __aenter__(self):
@@ -476,57 +506,85 @@ class ROOTFile:
     def keys(self):
         return self.keyslist.keys()
 
+    @property
+    def data(self):
+        def dig(item):
+            if isinstance(item, ROOTObject):
+                return {k: dig(v) for k, v in item.data.items()}
+            elif isinstance(item, dict):
+                return {k: dig(v) for k, v in item.items()}
+            return item
+
+        data = {
+            'fileheader': self.fileheader,
+            'rootkey': self.rootkey,
+            'rootdir': self.rootdir,
+            'keyslist': self.keyslist
+        }
+        return dig(data)
+
     async def __getitem__(self, key):
         key = self.keyslist[key]
-        print(key)
-        obj = ROOTFile.classmap[key['fClassName']]()
+        obj = ROOTFile.classmap[key.data['fClassName']]()
         # worth reading key at object? not doing now
-        objbytes = await self._file.read(key['fSeekKey'] + key['fKeylen'], key['fNbytes'] - key['fKeylen'])
+        objbytes = await self._file.read(key.data['fSeekKey'] + key.data['fKeylen'], key.data['fNbytes'] - key.data['fKeylen'])
 
         if key.compressed:
             cheader = CompressionHeader()
             offset = cheader.read(objbytes)
-            print(cheader)
-            # TODO run in thread pool
-            objbytes = cheader.decompressor()(memoryview(objbytes)[offset:])
+            objbytes = await self._run_in_pool(cheader.decompressor(), memoryview(objbytes)[offset:])
 
         obj.read(objbytes)
+        key.data['object'] = obj
         return obj
+
+
+async def getentries(url, threadpool=None):
+    async with ROOTFile(url, threadpool=threadpool) as file:
+        tree = await file[b'Events']
+        # pprint(file.data)
+    return url, tree.data['fEntries']
 
 
 async def main():
     urls = [
-        "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job10_job10_file600to659.root",
-        "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job11_job11_file660to719.root",
-        "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job12_job12_file720to779.root",
-        "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job13_job13_file780to839.root",
-        "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job14_job14_file840to899.root",
-        "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job15_job15_file900to959.root",
-        "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job16_job16_file960to1019.root",
-        "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job17_job17_file1020to1079.root",
-        "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job18_job18_file1080to1139.root",
-        "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job19_job19_file1140to1199.root",
-        "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job1_job1_file60to119.root",
-        "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job20_job20_file1200to1259.root",
-        "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job21_job21_file1260to1319.root",
-        "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job22_job22_file1320to1379.root",
-        "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job23_job23_file1380to1439.root",
-        "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job24_job24_file1440to1499.root",
-        "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job25_job25_file1500to1559.root",
-        "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job26_job26_file1560to1619.root",
-        "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job27_job27_file1620to1679.root",
-        "root://cmseos.fnal.gov//eos/uscms/store/user/lpcbacon/dazsle/zprimebits-v15.01/GluGluHToBB_M125_13TeV_powheg_pythia8/Output_job28_job28_file1680to1739.root",
+        "root://eospublic.cern.ch//eos/opendata/cms/derived-data/AOD2NanoAODOutreachTool/DYJetsToLL.root",
+        "root://eospublic.cern.ch//eos/opendata/cms/derived-data/AOD2NanoAODOutreachTool/GluGluToHToTauTau.root",
+        "root://eospublic.cern.ch//eos/opendata/cms/derived-data/AOD2NanoAODOutreachTool/Run2012BC_DoubleMuParked_Muons.root",
+        "root://eospublic.cern.ch//eos/opendata/cms/derived-data/AOD2NanoAODOutreachTool/Run2012B_TauPlusX.root",
+        "root://eospublic.cern.ch//eos/opendata/cms/derived-data/AOD2NanoAODOutreachTool/Run2012C_TauPlusX.root",
+        "root://eospublic.cern.ch//eos/opendata/cms/derived-data/AOD2NanoAODOutreachTool/TTbar.root",
+        "root://eospublic.cern.ch//eos/opendata/cms/derived-data/AOD2NanoAODOutreachTool/VBF_HToTauTau.root",
+        "root://eospublic.cern.ch//eos/opendata/cms/derived-data/AOD2NanoAODOutreachTool/W1JetsToLNu.root",
+        "root://eospublic.cern.ch//eos/opendata/cms/derived-data/AOD2NanoAODOutreachTool/W2JetsToLNu.root",
+        "root://eospublic.cern.ch//eos/opendata/cms/derived-data/AOD2NanoAODOutreachTool/W3JetsToLNu.root",
     ]
 
-    url = urls[0]
-    tic = time.time()
-    async with ROOTFile(url) as file:
-        print(file.keyslist.headkey)
-        print(list(file.keys()))
-        print(await file[b'Events'])
-    toc = time.time()
-    print("Elapsed:", toc - tic)
+    with ThreadPoolExecutor(max_workers=2) as threadpool:
+        # prime the plumbing
+        await getentries(urls[0], threadpool)
+
+        entries_async = {}
+        tic = time.time()
+        for result in asyncio.as_completed(map(partial(getentries, threadpool=threadpool), urls)):
+            url, entries = await result
+            entries_async[url] = entries
+        toc = time.time()
+        print("Elapsed (async):", toc - tic)
+
+        # prime the plumbing
+        await asyncio.get_event_loop().run_in_executor(threadpool, uproot.numentries, urls[0], b'Events')
+
+        entries_uproot = {}
+        tic = time.time()
+        for url in urls:
+            entries = await asyncio.get_event_loop().run_in_executor(threadpool, uproot.numentries, url, b'Events')
+            entries_uproot[url] = entries
+        toc = time.time()
+        print("Elapsed (uproot):", toc - tic)
+
+        print("All entries agree?", all(entries_async[url] == entries_uproot[url] for url in urls))
 
 
 if __name__ == '__main__':
-    asyncio.run(main(), debug=True)
+    asyncio.run(main(), debug=False)
