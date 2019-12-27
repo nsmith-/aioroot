@@ -16,6 +16,7 @@ class XRootDFile:
         self._file = File()
         self._timeout = 60
         self._servers = []
+        self._loop = None
 
     def _handle(self, future, status, content, servers):
         if future.cancelled():
@@ -24,12 +25,13 @@ class XRootDFile:
             if not status['ok']:
                 raise IOError(status['message'].strip())
             self._servers.append(servers)
-            future.get_loop().call_soon_threadsafe(future.set_result, content)
+            self._loop.call_soon_threadsafe(future.set_result, content)
         except Exception as exc:
-            future.get_loop().call_soon_threadsafe(future.set_exception, exc)
+            self._loop.call_soon_threadsafe(future.set_exception, exc)
 
     async def open(self):
-        future = asyncio.get_event_loop().create_future()
+        self._loop = asyncio.get_event_loop()
+        future = self._loop.create_future()
         res = self._file.open(self._url, timeout=self._timeout, callback=partial(self._handle, future))
         if not res['ok']:
             raise IOError(res['message'].strip())
@@ -46,16 +48,17 @@ class XRootDFile:
             raise IOError(res['message'].strip())
         await future
         self._file = None
+        self._loop = None
 
     async def stat(self):
-        future = asyncio.get_event_loop().create_future()
+        future = self._loop.create_future()
         res = self._file.stat(timeout=self._timeout, callback=partial(self._handle, future))
         if not res['ok']:
             raise IOError(res['message'].strip())
         return await future
 
     async def read(self, offset, size):
-        future = asyncio.get_event_loop().create_future()
+        future = self._loop.create_future()
         res = self._file.read(offset=offset, size=size, timeout=self._timeout, callback=partial(self._handle, future))
         if not res['ok']:
             raise IOError(res['message'].strip())
@@ -587,4 +590,6 @@ async def main():
 
 
 if __name__ == '__main__':
-    asyncio.run(main(), debug=False)
+    loop = asyncio.get_event_loop()
+    loop.set_debug(False)
+    loop.run_until_complete(main())
